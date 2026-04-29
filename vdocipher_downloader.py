@@ -336,56 +336,97 @@ class VDOCipherDownloader:
     # Player / screen-record mode
     # ------------------------------------------------------------------
 
-    def _find_electron(self, player_dir):
-        """Return the electron binary path, installing deps if needed."""
-        import shutil
+    _CHROME_PATHS = [
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta',
+        '/Applications/Chromium.app/Contents/MacOS/Chromium',
+        '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+        '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    ]
 
-        # Auto-install node_modules if missing
-        nm = os.path.join(player_dir, 'node_modules')
-        if not os.path.exists(nm):
-            print("Installing player dependencies (npm install)...")
-            result = subprocess.run(['npm', 'install'], cwd=player_dir)
-            if result.returncode != 0:
-                raise RuntimeError("npm install failed. Make sure Node.js is installed.")
+    def _find_chrome(self):
+        return next((p for p in self._CHROME_PATHS if os.path.exists(p)), None)
 
-        # Local .bin/electron installed by npm
-        local = os.path.join(player_dir, 'node_modules', '.bin', 'electron')
-        if os.path.exists(local):
-            return local
-
-        # Global electron
-        global_electron = shutil.which('electron')
-        if global_electron:
-            return global_electron
-
-        raise FileNotFoundError(
-            "Electron not found. Run:  cd player && npm install"
+    def _list_avfoundation_screens(self):
+        """Return the index of the first avfoundation screen device (default 1)."""
+        result = subprocess.run(
+            ['ffmpeg', '-f', 'avfoundation', '-list_devices', 'true', '-i', ''],
+            capture_output=True, text=True
         )
+        output = result.stderr
+        # Find lines like "[0] Capture screen 0"
+        screens = re.findall(r'\[(\d+)\] Capture screen', output)
+        return screens[0] if screens else '1'
 
     def play_in_player(self, url, output_dir='.', record=False):
-        """Open a VDO Cipher URL in the built-in Video.js + EME player."""
+        """Open VDO Cipher URL in Chrome (native Widevine) and optionally record via ffmpeg."""
+        from datetime import datetime
+
         url_data = self.parse_url(url)
-        player_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'player')
+        chrome = self._find_chrome()
 
-        if not os.path.isdir(player_dir):
-            raise FileNotFoundError(f"Player directory not found: {player_dir}")
+        ffmpeg_proc  = None
+        output_file  = None
 
-        electron = self._find_electron(player_dir)
-        os.makedirs(output_dir, exist_ok=True)
-
-        cmd = [
-            electron, '.',
-            '--otp', url_data['otp'],
-            '--playback-info', url_data['playback_info'],
-            '--output', os.path.abspath(output_dir),
-        ]
+        # ------------------------------------------------------------------
+        # Start screen recording before opening the browser
+        # ------------------------------------------------------------------
         if record:
-            cmd.append('--record')
+            os.makedirs(output_dir, exist_ok=True)
+            ts          = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_file = os.path.join(os.path.abspath(output_dir), f'recording_{ts}.mp4')
+            screen_idx  = self._list_avfoundation_screens()
 
-        print(f"Opening player for video: {url_data['video_id']}")
-        if record:
-            print("Screen recording is enabled – click 'Record' in the player toolbar.")
-        subprocess.run(cmd, cwd=player_dir)
+            ffmpeg_cmd = [
+                'ffmpeg', '-y',
+                '-f', 'avfoundation',
+                '-framerate', '30',
+                '-capture_cursor', '1',
+                '-i', screen_idx,          # screen only – avoids audio permission popup
+                '-vcodec', 'libx264',
+                '-preset', 'ultrafast',
+                '-crf', '23',
+                '-pix_fmt', 'yuv420p',
+                output_file,
+            ]
+            print(f"Starting screen recording → {output_file}")
+            ffmpeg_proc = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        # ------------------------------------------------------------------
+        # Open video in Chrome
+        # ------------------------------------------------------------------
+        print(f"Opening video {url_data['video_id']} in Chrome…")
+        if chrome:
+            subprocess.Popen([chrome, f'--app={url}'])
+        else:
+            subprocess.run(['open', url])   # fallback: default macOS browser
+
+        # ------------------------------------------------------------------
+        # Wait for user to finish, then stop ffmpeg
+        # ------------------------------------------------------------------
+        if ffmpeg_proc:
+            print("Recording in progress. Press Enter (or Ctrl-C) to stop and save.")
+            try:
+                input()
+            except KeyboardInterrupt:
+                pass
+
+            try:
+                ffmpeg_proc.stdin.write(b'q\n')
+                ffmpeg_proc.stdin.flush()
+                ffmpeg_proc.wait(timeout=8)
+            except Exception:
+                ffmpeg_proc.terminate()
+                ffmpeg_proc.wait()
+
+            print(f"Recording saved: {output_file}")
+        else:
+            print("Chrome opened. Close the browser window when done.")
 
     def process_file(self, file_path, output_dir="./downloaded-videos", skip_drm=False, device_path=None):
         """Process URLs from a text file."""
