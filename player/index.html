@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>VDO Cipher Player</title>
+  <link rel="stylesheet" href="./node_modules/video.js/dist/video-js.css" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #000;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    #player-wrap {
+      flex: 1;
+      position: relative;
+      background: #000;
+    }
+
+    #vdo-player {
+      width: 100% !important;
+      height: 100% !important;
+    }
+
+    /* Status overlay shown while loading */
+    #overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 15px;
+      color: #aaa;
+      pointer-events: none;
+    }
+
+    /* Bottom toolbar */
+    #toolbar {
+      height: 44px;
+      background: #111;
+      border-top: 1px solid #222;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 14px;
+      flex-shrink: 0;
+    }
+
+    #status-text {
+      font-size: 12px;
+      color: #888;
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    button {
+      border: none;
+      border-radius: 4px;
+      padding: 5px 14px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    button:hover { opacity: 0.85; }
+    button:disabled { opacity: 0.4; cursor: default; }
+
+    #record-btn  { background: #c62828; color: #fff; }
+    #stop-btn    { background: #37474f; color: #fff; display: none; }
+
+    .dot {
+      display: inline-block;
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #f44336;
+      margin-right: 5px;
+      animation: blink 1s step-start infinite;
+    }
+    @keyframes blink { 50% { opacity: 0; } }
+  </style>
+</head>
+<body>
+
+<div id="player-wrap">
+  <video id="vdo-player" class="video-js vjs-default-skin" controls autoplay playsinline></video>
+  <div id="overlay">Loading video…</div>
+</div>
+
+<div id="toolbar">
+  <span id="status-text">Initialising…</span>
+  <button id="record-btn" style="display:none">⏺ Record</button>
+  <button id="stop-btn">⏹ Stop &amp; Save</button>
+</div>
+
+<!-- Video.js + EME plugin (loaded from local node_modules) -->
+<script src="./node_modules/video.js/dist/video.js"></script>
+<script src="./node_modules/videojs-contrib-eme/dist/videojs-contrib-eme.js"></script>
+
+<script>
+(async () => {
+  const overlay    = document.getElementById('overlay');
+  const statusText = document.getElementById('status-text');
+  const recordBtn  = document.getElementById('record-btn');
+  const stopBtn    = document.getElementById('stop-btn');
+
+  const setStatus = (msg) => { statusText.textContent = msg; };
+
+  // ------------------------------------------------------------------
+  // 1. Fetch video config from main process
+  // ------------------------------------------------------------------
+  const config = await window.electronAPI.getVideoConfig();
+
+  if (!config || config.error) {
+    overlay.textContent = `Error: ${config?.error || 'No config received'}`;
+    setStatus('Failed to load');
+    return;
+  }
+
+  overlay.style.display = 'none';
+  setStatus(`Loading: ${config.src.split('/').pop().slice(0, 60)}`);
+
+  // ------------------------------------------------------------------
+  // 2. Initialise Video.js
+  // ------------------------------------------------------------------
+  const player = videojs('vdo-player', {
+    controls: true,
+    autoplay: true,
+    fill: true,
+    html5: {
+      vhs: { overrideNative: true },
+      nativeVideoTracks: false,
+      nativeAudioTracks: false,
+    },
+  });
+
+  player.ready(function () {
+    // Activate EME plugin
+    player.eme();
+
+    const src = { src: config.src, type: config.type };
+
+    // Attach Widevine key-system config for DASH streams
+    if (config.type === 'application/dash+xml') {
+      src.keySystems = {
+        'com.widevine.alpha': {
+          url: config.licenseUrl,
+          licenseHeaders: { 'X-VDO-Otp': config.otp },
+        },
+      };
+    }
+
+    player.src(src);
+  });
+
+  player.on('playing', () => setStatus('Playing'));
+  player.on('waiting', () => setStatus('Buffering…'));
+  player.on('ended',   () => setStatus('Ended'));
+  player.on('error',   () => setStatus(`Error: ${player.error()?.message || 'playback failed'}`));
+
+  // ------------------------------------------------------------------
+  // 3. Screen recording (only shown when launched with --record)
+  // ------------------------------------------------------------------
+  if (config.recordMode) {
+    recordBtn.style.display = 'inline-block';
+  }
+
+  let mediaRecorder = null;
+  let chunks        = [];
+
+  recordBtn.addEventListener('click', async () => {
+    try {
+      setStatus('Requesting screen capture permission…');
+
+      const sources = await window.electronAPI.getDesktopSources();
+
+      // Prefer the player window itself; fall back to full screen 0
+      const source =
+        sources.find((s) => s.name === 'VDO Cipher Player') ||
+        sources.find((s) => s.name.toLowerCase().includes('screen')) ||
+        sources[0];
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { mandatory: { chromeMediaSource: 'desktop' } },
+        video: {
+          mandatory: {
+            chromeMediaSource: 'desktop',
+            chromeMediaSourceId: source.id,
+            minWidth: 1280, maxWidth: 1920,
+            minHeight: 720, maxHeight: 1080,
+          },
+        },
+      });
+
+      chunks = [];
+      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+        ? 'video/webm;codecs=vp9,opus'
+        : 'video/webm';
+
+      mediaRecorder = new MediaRecorder(stream, { mimeType });
+      mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+      mediaRecorder.start(1000); // collect chunks every second
+
+      recordBtn.innerHTML = '<span class="dot"></span>Recording';
+      recordBtn.disabled  = true;
+      stopBtn.style.display = 'inline-block';
+      setStatus('Recording screen…');
+    } catch (err) {
+      setStatus(`Recording failed: ${err.message}`);
+    }
+  });
+
+  stopBtn.addEventListener('click', () => {
+    if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
+    stopBtn.disabled = true;
+    setStatus('Saving recording…');
+
+    mediaRecorder.onstop = async () => {
+      try {
+        const blob        = new Blob(chunks, { type: 'video/webm' });
+        const arrayBuffer = await blob.arrayBuffer();
+        const buffer      = Array.from(new Uint8Array(arrayBuffer));
+
+        const ts       = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const filename = `recording-${ts}.webm`;
+        const saved    = await window.electronAPI.saveRecording(buffer, filename);
+
+        setStatus(`Saved → ${saved}`);
+      } catch (err) {
+        setStatus(`Save failed: ${err.message}`);
+      } finally {
+        mediaRecorder.stream.getTracks().forEach((t) => t.stop());
+        recordBtn.innerHTML  = '⏺ Record';
+        recordBtn.disabled   = false;
+        stopBtn.style.display = 'none';
+        stopBtn.disabled     = false;
+      }
+    };
+
+    mediaRecorder.stop();
+  });
+})();
+</script>
+</body>
+</html>
