@@ -333,6 +333,89 @@ class VDOCipherDownloader:
             return False
 
     # ------------------------------------------------------------------
+    # Config-based direct download (from browser network tab JSON)
+    # ------------------------------------------------------------------
+
+    def download_from_config(self, config, otp, output_dir='.', device_path=None):
+        """
+        Download using the VDO Cipher player config JSON extracted from the
+        browser network tab, combined with the OTP from the player URL.
+
+        The config JSON contains the DASH manifest URL and Widevine license
+        server template.  The OTP is substituted for the ':authToken' placeholder
+        in the license URL.
+        """
+        if isinstance(config, str):
+            config = json.loads(config)
+
+        dash = config.get('dash', {})
+        mpd_url = dash.get('manifest')
+        if not mpd_url:
+            raise ValueError("Config does not contain a 'dash.manifest' URL")
+
+        # Build the actual license URL – substitute :authToken with the OTP
+        license_servers = dash.get('licenseServers', {})
+        wv_url_template = (
+            license_servers.get('com.widevine.alpha') or
+            'https://license.vdocipher.com/auth3/wv/:authToken'
+        )
+        license_url = wv_url_template.replace(':authToken', otp)
+
+        # Derive a stable filename from the content ID embedded in the manifest URL
+        content_id_match = re.search(r'/manifest/([a-f0-9]+)\.mpd', mpd_url)
+        video_id = content_id_match.group(1) if content_id_match else 'video'
+        title = re.sub(r'[^\w\-]', '_', config.get('title', video_id))
+
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f'{title}.mp4')
+
+        print(f"Video   : {config.get('title', video_id)}")
+        print(f"Manifest: {mpd_url}")
+        print(f"License : {license_url}")
+
+        if not device_path:
+            raise ValueError(
+                "Widevine device file required for DRM content.\n"
+                "Provide one with --device <path.wvd>\n\n"
+                "If you do not have a .wvd file, the content cannot be decrypted.\n"
+                "Screen recording of DRM-protected Chrome windows is blocked at the\n"
+                "macOS WindowServer level (psr:true in VDO Cipher config) and cannot\n"
+                "be bypassed with software screen capture tools."
+            )
+
+        handler = DRMHandler(self.session, device_path)
+
+        print("Extracting Widevine PSSH from manifest…")
+        pssh_b64 = handler.extract_pssh_from_mpd(mpd_url)
+
+        print("Requesting Widevine license…")
+        keys = handler.get_keys(pssh_b64, license_url, otp)
+        if not keys:
+            raise RuntimeError("License server returned no content keys")
+
+        print(f"Keys: {', '.join(f'{k}:{v}' for k, v in keys)}")
+
+        encrypted_path = output_path + '.enc.mp4'
+        print(f"Downloading encrypted DASH stream…")
+        dl_cmd = ['ffmpeg', '-y', '-i', mpd_url, '-c', 'copy', encrypted_path]
+        result = subprocess.run(dl_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg download failed:\n{result.stderr}")
+
+        print(f"Decrypting…")
+        key_args = []
+        for kid, key in keys:
+            key_args += ['--key', f'{kid}:{key}']
+        dec_cmd = ['mp4decrypt'] + key_args + [encrypted_path, output_path]
+        result = subprocess.run(dec_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"mp4decrypt failed:\n{result.stderr}")
+
+        os.remove(encrypted_path)
+        print(f"Saved: {output_path}")
+        return True
+
+    # ------------------------------------------------------------------
     # Player / screen-record mode
     # ------------------------------------------------------------------
 
@@ -523,24 +606,43 @@ class VDOCipherDownloader:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='VDO Cipher Video Downloader')
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--url', help='Single VDO Cipher video URL')
-    group.add_argument('--file', '-f', help='Text file containing VDO Cipher URLs (one per line)')
+    parser = argparse.ArgumentParser(
+        description='VDO Cipher Video Downloader',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Open in Chrome (DRM plays natively)
+  %(prog)s --url "https://player.vdocipher.com/v2/?otp=...&playbackInfo=..." --player
+
+  # Record screen while playing (requires ffmpeg)
+  %(prog)s --url "..." --player --screen-record --output ./downloads
+
+  # Download + decrypt from browser config JSON (requires mp4decrypt + .wvd)
+  %(prog)s --config config.json --otp "20160313vers..." --device device.wvd
+"""
+    )
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument('--url', help='Single VDO Cipher player URL')
+    input_group.add_argument('--file', '-f', help='Text file with one VDO Cipher URL per line')
+    input_group.add_argument('--config', metavar='PATH',
+                             help='VDO Cipher player config JSON file (from browser network tab)')
+
+    parser.add_argument('--otp', metavar='TOKEN',
+                        help='OTP token from the player URL (required with --config)')
     parser.add_argument('-o', '--output', default='./downloaded-videos',
                         help='Output directory (default: ./downloaded-videos)')
 
-    # Download / DRM bypass flags
+    # DRM bypass
     parser.add_argument('--skip-drm', action='store_true',
-                        help='Bypass Widevine DRM (requires --device and mp4decrypt)')
+                        help='Bypass Widevine DRM via pywidevine (requires --device and mp4decrypt)')
     parser.add_argument('--device', metavar='PATH',
                         help='Widevine device file (.wvd) for key extraction')
 
-    # Player / screen-record flags
+    # Player / screen-record
     parser.add_argument('--player', action='store_true',
-                        help='Open the video in the built-in Video.js + EME player (requires Node.js)')
+                        help='Open the video in Chrome (native DRM support)')
     parser.add_argument('--screen-record', action='store_true',
-                        help='Enable screen recording inside the player (use with --player)')
+                        help='Record the screen while the player is open (use with --player)')
 
     args = parser.parse_args()
 
@@ -548,15 +650,28 @@ def main():
         parser.error("--skip-drm requires --device <path-to-.wvd-file>")
     if args.screen_record and not args.player:
         parser.error("--screen-record requires --player")
+    if args.config and not args.otp:
+        parser.error("--config requires --otp <token>")
 
     downloader = VDOCipherDownloader()
 
-    if args.url:
+    if args.config:
+        with open(args.config, 'r', encoding='utf-8') as fh:
+            config = json.load(fh)
+        os.makedirs(args.output, exist_ok=True)
+        try:
+            downloader.download_from_config(
+                config, args.otp, args.output, device_path=args.device
+            )
+        except Exception as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+    elif args.url:
         if not args.url.startswith('https://player.vdocipher.com/'):
             print("Error: Please provide a valid VDO Cipher URL")
             sys.exit(1)
         os.makedirs(args.output, exist_ok=True)
-
         if args.player:
             downloader.play_in_player(args.url, args.output, record=args.screen_record)
         else:
@@ -565,7 +680,6 @@ def main():
 
     elif args.file:
         if args.player:
-            # Open each URL in the player sequentially
             with open(args.file, 'r', encoding='utf-8') as fh:
                 urls = [l.strip() for l in fh if l.strip()]
             for url in urls:
