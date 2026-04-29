@@ -332,6 +332,61 @@ class VDOCipherDownloader:
             print(f"Error processing {url}: {str(e)}")
             return False
 
+    # ------------------------------------------------------------------
+    # Player / screen-record mode
+    # ------------------------------------------------------------------
+
+    def _find_electron(self, player_dir):
+        """Return the electron binary path, installing deps if needed."""
+        import shutil
+
+        # Auto-install node_modules if missing
+        nm = os.path.join(player_dir, 'node_modules')
+        if not os.path.exists(nm):
+            print("Installing player dependencies (npm install)...")
+            result = subprocess.run(['npm', 'install'], cwd=player_dir)
+            if result.returncode != 0:
+                raise RuntimeError("npm install failed. Make sure Node.js is installed.")
+
+        # Local .bin/electron installed by npm
+        local = os.path.join(player_dir, 'node_modules', '.bin', 'electron')
+        if os.path.exists(local):
+            return local
+
+        # Global electron
+        global_electron = shutil.which('electron')
+        if global_electron:
+            return global_electron
+
+        raise FileNotFoundError(
+            "Electron not found. Run:  cd player && npm install"
+        )
+
+    def play_in_player(self, url, output_dir='.', record=False):
+        """Open a VDO Cipher URL in the built-in Video.js + EME player."""
+        url_data = self.parse_url(url)
+        player_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'player')
+
+        if not os.path.isdir(player_dir):
+            raise FileNotFoundError(f"Player directory not found: {player_dir}")
+
+        electron = self._find_electron(player_dir)
+        os.makedirs(output_dir, exist_ok=True)
+
+        cmd = [
+            electron, '.',
+            '--otp', url_data['otp'],
+            '--playback-info', url_data['playback_info'],
+            '--output', os.path.abspath(output_dir),
+        ]
+        if record:
+            cmd.append('--record')
+
+        print(f"Opening player for video: {url_data['video_id']}")
+        if record:
+            print("Screen recording is enabled – click 'Record' in the player toolbar.")
+        subprocess.run(cmd, cwd=player_dir)
+
     def process_file(self, file_path, output_dir="./downloaded-videos", skip_drm=False, device_path=None):
         """Process URLs from a text file."""
         try:
@@ -379,15 +434,25 @@ def main():
     group.add_argument('--file', '-f', help='Text file containing VDO Cipher URLs (one per line)')
     parser.add_argument('-o', '--output', default='./downloaded-videos',
                         help='Output directory (default: ./downloaded-videos)')
+
+    # Download / DRM bypass flags
     parser.add_argument('--skip-drm', action='store_true',
-                        help='Bypass Widevine DRM protection (requires --device and mp4decrypt)')
+                        help='Bypass Widevine DRM (requires --device and mp4decrypt)')
     parser.add_argument('--device', metavar='PATH',
-                        help='Path to Widevine device file (.wvd) used for key extraction')
+                        help='Widevine device file (.wvd) for key extraction')
+
+    # Player / screen-record flags
+    parser.add_argument('--player', action='store_true',
+                        help='Open the video in the built-in Video.js + EME player (requires Node.js)')
+    parser.add_argument('--screen-record', action='store_true',
+                        help='Enable screen recording inside the player (use with --player)')
 
     args = parser.parse_args()
 
     if args.skip_drm and not args.device:
         parser.error("--skip-drm requires --device <path-to-.wvd-file>")
+    if args.screen_record and not args.player:
+        parser.error("--screen-record requires --player")
 
     downloader = VDOCipherDownloader()
 
@@ -396,12 +461,24 @@ def main():
             print("Error: Please provide a valid VDO Cipher URL")
             sys.exit(1)
         os.makedirs(args.output, exist_ok=True)
-        downloader.process_url(args.url, args.output,
-                               skip_drm=args.skip_drm, device_path=args.device)
+
+        if args.player:
+            downloader.play_in_player(args.url, args.output, record=args.screen_record)
+        else:
+            downloader.process_url(args.url, args.output,
+                                   skip_drm=args.skip_drm, device_path=args.device)
 
     elif args.file:
-        downloader.process_file(args.file, args.output,
-                                skip_drm=args.skip_drm, device_path=args.device)
+        if args.player:
+            # Open each URL in the player sequentially
+            with open(args.file, 'r', encoding='utf-8') as fh:
+                urls = [l.strip() for l in fh if l.strip()]
+            for url in urls:
+                if url.startswith('https://player.vdocipher.com/'):
+                    downloader.play_in_player(url, args.output, record=args.screen_record)
+        else:
+            downloader.process_file(args.file, args.output,
+                                    skip_drm=args.skip_drm, device_path=args.device)
 
 
 if __name__ == "__main__":
