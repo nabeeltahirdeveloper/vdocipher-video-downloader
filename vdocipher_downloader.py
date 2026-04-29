@@ -347,49 +347,103 @@ class VDOCipherDownloader:
     def _find_chrome(self):
         return next((p for p in self._CHROME_PATHS if os.path.exists(p)), None)
 
-    def _list_avfoundation_screens(self):
-        """Return the index of the first avfoundation screen device (default 1)."""
+    def _list_avfoundation_devices(self):
+        """Return (screen_index, device_list_text) from avfoundation."""
         result = subprocess.run(
             ['ffmpeg', '-f', 'avfoundation', '-list_devices', 'true', '-i', ''],
             capture_output=True, text=True
         )
         output = result.stderr
-        # Find lines like "[0] Capture screen 0"
+        # Lines look like: [AVFoundation ...] [1] Capture screen 0
         screens = re.findall(r'\[(\d+)\] Capture screen', output)
-        return screens[0] if screens else '1'
+        return screens[0] if screens else '0', output
+
+    def _check_screen_permission(self, screen_idx, output_file):
+        """
+        Do a 1-second test capture and check if the file contains real video data.
+        Returns True if the permission is granted, False if blank/black.
+        """
+        test_file = output_file + '.permission_test.mp4'
+        test_cmd = [
+            'ffmpeg', '-y', '-loglevel', 'error',
+            '-f', 'avfoundation', '-framerate', '5', '-t', '1',
+            '-i', screen_idx,
+            '-vf', 'blackdetect=d=0.5:pix_th=0.1',
+            '-vcodec', 'libx264', '-preset', 'ultrafast',
+            test_file
+        ]
+        result = subprocess.run(test_cmd, capture_output=True, text=True)
+        try:
+            size = os.path.getsize(test_file)
+            os.remove(test_file)
+            # A valid 1-second capture at 5fps should be well over 5 KB;
+            # macOS returns a tiny/empty file when permission is denied.
+            return size > 5000
+        except FileNotFoundError:
+            return False
 
     def play_in_player(self, url, output_dir='.', record=False):
         """Open VDO Cipher URL in Chrome (native Widevine) and optionally record via ffmpeg."""
+        import time
         from datetime import datetime
 
         url_data = self.parse_url(url)
-        chrome = self._find_chrome()
+        chrome   = self._find_chrome()
 
-        ffmpeg_proc  = None
-        output_file  = None
+        ffmpeg_proc = None
+        output_file = None
 
         # ------------------------------------------------------------------
-        # Start screen recording before opening the browser
+        # Screen recording setup
         # ------------------------------------------------------------------
         if record:
             os.makedirs(output_dir, exist_ok=True)
             ts          = datetime.now().strftime('%Y%m%d_%H%M%S')
             output_file = os.path.join(os.path.abspath(output_dir), f'recording_{ts}.mp4')
-            screen_idx  = self._list_avfoundation_screens()
+
+            screen_idx, device_list = self._list_avfoundation_devices()
+            print(f"Detected screen device index: {screen_idx}")
+
+            # Permission check
+            print("Checking screen recording permission…")
+            if not self._check_screen_permission(screen_idx, output_file):
+                print()
+                print("=" * 60)
+                print("  BLANK SCREEN – Screen Recording permission required")
+                print("=" * 60)
+                print()
+                print("  1. Open:  System Settings → Privacy & Security")
+                print("            → Screen Recording")
+                print("  2. Enable the toggle next to your Terminal app")
+                print("     (Terminal, iTerm2, Warp, etc.)")
+                print("  3. Restart your terminal completely")
+                print("  4. Re-run this command")
+                print()
+                print("  If the toggle is already on, try toggling it off")
+                print("  and on again, then restart the terminal.")
+                print()
+                return
+
+            # 5-second countdown so the user can switch to the video
+            print(f"\nRecording to: {output_file}")
+            print("Chrome will open now. Switch to it and start the video.")
+            for i in range(5, 0, -1):
+                print(f"  Recording starts in {i}…", end='\r')
+                time.sleep(1)
+            print("  Recording started!          ")
 
             ffmpeg_cmd = [
-                'ffmpeg', '-y',
+                'ffmpeg', '-y', '-loglevel', 'error',
                 '-f', 'avfoundation',
                 '-framerate', '30',
                 '-capture_cursor', '1',
-                '-i', screen_idx,          # screen only – avoids audio permission popup
+                '-i', screen_idx,
                 '-vcodec', 'libx264',
                 '-preset', 'ultrafast',
                 '-crf', '23',
                 '-pix_fmt', 'yuv420p',
                 output_file,
             ]
-            print(f"Starting screen recording → {output_file}")
             ffmpeg_proc = subprocess.Popen(
                 ffmpeg_cmd,
                 stdin=subprocess.PIPE,
@@ -404,10 +458,10 @@ class VDOCipherDownloader:
         if chrome:
             subprocess.Popen([chrome, f'--app={url}'])
         else:
-            subprocess.run(['open', url])   # fallback: default macOS browser
+            subprocess.run(['open', url])
 
         # ------------------------------------------------------------------
-        # Wait for user to finish, then stop ffmpeg
+        # Wait, then stop ffmpeg
         # ------------------------------------------------------------------
         if ffmpeg_proc:
             print("Recording in progress. Press Enter (or Ctrl-C) to stop and save.")

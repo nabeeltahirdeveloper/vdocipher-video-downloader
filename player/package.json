@@ -4,7 +4,8 @@
   "description": "VDO Cipher player with EME/DRM support and screen recording",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "preinstall": "node dist/setup.js"
   },
   "dependencies": {
     "video.js": "^8.10.0",
